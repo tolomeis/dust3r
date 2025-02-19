@@ -106,6 +106,43 @@ def _convert_scene_output_to_glb(outdir, imgs, pts3d, mask, focals, cams2world, 
     scene.export(file_obj=outfile)
     return outfile
 
+def _save_pointcloud_and_cameras(outdir, imgs, pts3d, mask, focals, cams2world, silent=False):
+    """Saves point cloud as PLY and camera poses as TXT files."""
+    assert len(pts3d) == len(mask) <= len(imgs) <= len(cams2world) == len(focals)
+    pts3d = to_numpy(pts3d)
+    imgs = to_numpy(imgs)
+    focals = to_numpy(focals)
+    cams2world = to_numpy(cams2world)
+
+    # Save point cloud as PLY
+    pts = np.concatenate([p[m] for p, m in zip(pts3d, mask)])
+    col = np.concatenate([p[m] for p, m in zip(imgs, mask)])
+    pointcloud = trimesh.PointCloud(pts.reshape(-1, 3), colors=col.reshape(-1, 3))
+    pc_outfile = os.path.join(outdir, 'pointcloud.ply')
+    if not silent:
+        print('(exporting point cloud to', pc_outfile, ')')
+    pointcloud.export(pc_outfile)
+
+    # Save camera poses and intrinsics as TXT
+    camera_data = []
+    for i in range(len(cams2world)):
+        pose = cams2world[i].tolist()
+        focal = focals[i].tolist()
+        camera_data.append({'pose': pose, 'focal': focal})
+
+    camera_outfile = os.path.join(outdir, 'camera_poses.txt')
+    if not silent:
+        print('(exporting camera poses to', camera_outfile, ')')
+    with open(camera_outfile, 'w') as f:
+        f.write("Camera Poses and Focal Lengths (4x4 matrix row-major, focal length)\n")
+        for i, data in enumerate(camera_data):
+            f.write(f"Camera {i}:\n")
+            pose_str = ' '.join(map(str, [val for row in data['pose'] for val in row])) # Flatten matrix to row-major string
+            f.write(f"Pose: {pose_str}\n")
+            f.write(f"Focal Length: {data['focal']}\n")
+            f.write("\n")
+    return pc_outfile, camera_outfile
+
 
 def get_3D_model_from_scene(outdir, silent, scene, min_conf_thr=3, as_pointcloud=False, mask_sky=False,
                             clean_depth=False, transparent_cams=False, cam_size=0.05):
@@ -128,8 +165,12 @@ def get_3D_model_from_scene(outdir, silent, scene, min_conf_thr=3, as_pointcloud
     pts3d = to_numpy(scene.get_pts3d())
     scene.min_conf_thr = float(scene.conf_trf(torch.tensor(min_conf_thr)))
     msk = to_numpy(scene.get_masks())
-    return _convert_scene_output_to_glb(outdir, rgbimg, pts3d, msk, focals, cams2world, as_pointcloud=as_pointcloud,
+
+    glb_outfile = _convert_scene_output_to_glb(outdir, rgbimg, pts3d, msk, focals, cams2world, as_pointcloud=as_pointcloud,
                                         transparent_cams=transparent_cams, cam_size=cam_size, silent=silent)
+    pc_outfile, camera_outfile = _save_pointcloud_and_cameras(outdir, rgbimg, pts3d, msk, focals, cams2world, silent=silent)
+
+    return glb_outfile, pc_outfile, camera_outfile
 
 
 def get_reconstructed_scene(outdir, model, device, silent, image_size, filelist, schedule, niter, min_conf_thr,
@@ -158,7 +199,7 @@ def get_reconstructed_scene(outdir, model, device, silent, image_size, filelist,
     if mode == GlobalAlignerMode.PointCloudOptimizer:
         loss = scene.compute_global_alignment(init='mst', niter=niter, schedule=schedule, lr=lr)
 
-    outfile = get_3D_model_from_scene(outdir, silent, scene, min_conf_thr, as_pointcloud, mask_sky,
+    glb_outfile, pc_outfile, camera_outfile = get_3D_model_from_scene(outdir, silent, scene, min_conf_thr, as_pointcloud, mask_sky,
                                       clean_depth, transparent_cams, cam_size)
 
     # also return rgb, depth and confidence imgs
@@ -173,13 +214,13 @@ def get_reconstructed_scene(outdir, model, device, silent, image_size, filelist,
     confs_max = max([d.max() for d in confs])
     confs = [cmap(d / confs_max) for d in confs]
 
-    imgs = []
+    imgs_output = []
     for i in range(len(rgbimg)):
-        imgs.append(rgbimg[i])
-        imgs.append(rgb(depths[i]))
-        imgs.append(rgb(confs[i]))
+        imgs_output.append(rgbimg[i])
+        imgs_output.append(rgb(depths[i]))
+        imgs_output.append(rgb(confs[i]))
 
-    return scene, outfile, imgs
+    return scene, glb_outfile, pc_outfile, camera_outfile, imgs_output
 
 
 def set_scenegraph_options(inputfiles, winsize, refid, scenegraph_type):
@@ -199,17 +240,20 @@ def set_scenegraph_options(inputfiles, winsize, refid, scenegraph_type):
         winsize = gradio.Slider(label="Scene Graph: Window Size", value=max_winsize,
                                 minimum=1, maximum=max_winsize, step=1, visible=False)
         refid = gradio.Slider(label="Scene Graph: Id", value=0, minimum=0,
-                              maximum=num_files - 1, step=1, visible=False)
+                                maximum=num_files - 1, step=1, visible=False)
     return winsize, refid
 
 
 def main_demo(tmpdirname, model, device, image_size, server_name, server_port, silent=False):
     recon_fun = functools.partial(get_reconstructed_scene, tmpdirname, model, device, silent, image_size)
     model_from_scene_fun = functools.partial(get_3D_model_from_scene, tmpdirname, silent)
-    with gradio.Blocks(css=""".gradio-container {margin: 0 !important; min-width: 100%};""", title="DUSt3R Demo") as demo:
+    with gradio.Blocks(css=""".gradio-container {margin: 0 !important; min-width: 100%};""", title="MODIFIED DUSt3R Demo") as demo:
         # scene state is save so that you can change conf_thr, cam_size... without rerunning the inference
         scene = gradio.State(None)
-        gradio.HTML('<h2 style="text-align: center;">DUSt3R Demo</h2>')
+        glb_model_path = gradio.State(None) # State to hold path to glb model
+        pc_model_path = gradio.State(None)  # State to hold path to pointcloud model
+        camera_pose_path = gradio.State(None) # State to hold path to camera poses
+        gradio.HTML('<h2 style="text-align: center;">MODIFIED DUSt3R Demo</h2>')
         with gradio.Column():
             inputfiles = gradio.File(file_count="multiple")
             with gradio.Row():
@@ -244,6 +288,12 @@ def main_demo(tmpdirname, model, device, image_size, server_name, server_port, s
             outmodel = gradio.Model3D()
             outgallery = gradio.Gallery(label='rgb,depth,confidence', columns=3, height="100%")
 
+            # New elements to show file paths for download
+            with gradio.Row():
+                glb_filepath_display = gradio.Textbox(label="GLB Model Path", interactive=False)
+                pc_filepath_display = gradio.Textbox(label="Point Cloud PLY Path", interactive=False)
+                camera_pose_filepath_display = gradio.Textbox(label="Camera Poses TXT Path", interactive=False)
+
             # events
             scenegraph_type.change(set_scenegraph_options,
                                    inputs=[inputfiles, winsize, refid, scenegraph_type],
@@ -255,29 +305,64 @@ def main_demo(tmpdirname, model, device, image_size, server_name, server_port, s
                           inputs=[inputfiles, schedule, niter, min_conf_thr, as_pointcloud,
                                   mask_sky, clean_depth, transparent_cams, cam_size,
                                   scenegraph_type, winsize, refid],
-                          outputs=[scene, outmodel, outgallery])
+                          outputs=[scene, glb_model_path, pc_model_path, camera_pose_path, outgallery])
+            run_btn.click(lambda path: path, inputs=glb_model_path, outputs=glb_filepath_display, api_name="get_glb_path") # Just to trigger update, value is already in state
+            run_btn.click(lambda path: path, inputs=pc_model_path, outputs=pc_filepath_display, api_name="get_pc_path")
+            run_btn.click(lambda path: path, inputs=camera_pose_path, outputs=camera_pose_filepath_display, api_name="get_camera_pose_path")
+
+
             min_conf_thr.release(fn=model_from_scene_fun,
                                  inputs=[scene, min_conf_thr, as_pointcloud, mask_sky,
                                          clean_depth, transparent_cams, cam_size],
-                                 outputs=outmodel)
+                                 outputs=[outmodel, glb_model_path, pc_model_path, camera_pose_path]) # outputs also paths, but we dont use them in release
+            min_conf_thr.release(lambda path: path, inputs=glb_model_path, outputs=glb_filepath_display, api_name="get_glb_path_min_conf") # update paths on slider release
+            min_conf_thr.release(lambda path: path, inputs=pc_model_path, outputs=pc_filepath_display, api_name="get_pc_path_min_conf")
+            min_conf_thr.release(lambda path: path, inputs=camera_pose_path, outputs=camera_pose_filepath_display, api_name="get_camera_pose_path_min_conf")
+
+
             cam_size.change(fn=model_from_scene_fun,
                             inputs=[scene, min_conf_thr, as_pointcloud, mask_sky,
                                     clean_depth, transparent_cams, cam_size],
-                            outputs=outmodel)
+                            outputs=[outmodel, glb_model_path, pc_model_path, camera_pose_path]) # outputs also paths, but we dont use them in release
+            cam_size.change(lambda path: path, inputs=glb_model_path, outputs=glb_filepath_display, api_name="get_glb_path_cam_size") # update paths on slider change
+            cam_size.change(lambda path: path, inputs=pc_model_path, outputs=pc_filepath_display, api_name="get_pc_path_cam_size")
+            cam_size.change(lambda path: path, inputs=camera_pose_path, outputs=camera_pose_filepath_display, api_name="get_camera_pose_path_cam_size")
+
+
             as_pointcloud.change(fn=model_from_scene_fun,
                                  inputs=[scene, min_conf_thr, as_pointcloud, mask_sky,
                                          clean_depth, transparent_cams, cam_size],
-                                 outputs=outmodel)
+                                 outputs=[outmodel, glb_model_path, pc_model_path, camera_pose_path]) # outputs also paths, but we dont use them in release
+            as_pointcloud.change(lambda path: path, inputs=glb_model_path, outputs=glb_filepath_display, api_name="get_glb_path_pc") # update paths on checkbox change
+            as_pointcloud.change(lambda path: path, inputs=pc_model_path, outputs=pc_filepath_display, api_name="get_pc_path_pc")
+            as_pointcloud.change(lambda path: path, inputs=camera_pose_path, outputs=camera_pose_filepath_display, api_name="get_camera_pose_path_pc")
+
+
             mask_sky.change(fn=model_from_scene_fun,
                             inputs=[scene, min_conf_thr, as_pointcloud, mask_sky,
                                     clean_depth, transparent_cams, cam_size],
-                            outputs=outmodel)
+                            outputs=[outmodel, glb_model_path, pc_model_path, camera_pose_path]) # outputs also paths, but we dont use them in release
+            mask_sky.change(lambda path: path, inputs=glb_model_path, outputs=glb_filepath_display, api_name="get_glb_path_sky") # update paths on checkbox change
+            mask_sky.change(lambda path: path, inputs=pc_model_path, outputs=pc_filepath_display, api_name="get_pc_path_sky")
+            mask_sky.change(lambda path: path, inputs=camera_pose_path, outputs=camera_pose_filepath_display, api_name="get_camera_pose_path_sky")
+
+
             clean_depth.change(fn=model_from_scene_fun,
                                inputs=[scene, min_conf_thr, as_pointcloud, mask_sky,
                                        clean_depth, transparent_cams, cam_size],
-                               outputs=outmodel)
+                               outputs=[outmodel, glb_model_path, pc_model_path, camera_pose_path]) # outputs also paths, but we dont use them in release
+            clean_depth.change(lambda path: path, inputs=glb_model_path, outputs=glb_filepath_display, api_name="get_glb_path_depth") # update paths on checkbox change
+            clean_depth.change(lambda path: path, inputs=pc_model_path, outputs=pc_filepath_display, api_name="get_pc_path_depth")
+            clean_depth.change(lambda path: path, inputs=camera_pose_path, outputs=camera_pose_filepath_display, api_name="get_camera_pose_path_depth")
+
+
             transparent_cams.change(model_from_scene_fun,
                                     inputs=[scene, min_conf_thr, as_pointcloud, mask_sky,
                                             clean_depth, transparent_cams, cam_size],
-                                    outputs=outmodel)
+                                    outputs=[outmodel, glb_model_path, pc_model_path, camera_pose_path]) # outputs also paths, but we dont use them in release
+            transparent_cams.change(lambda path: path, inputs=glb_model_path, outputs=glb_filepath_display, api_name="get_glb_path_transcam") # update paths on checkbox change
+            transparent_cams.change(lambda path: path, inputs=pc_model_path, outputs=pc_filepath_display, api_name="get_pc_path_transcam")
+            transparent_cams.change(lambda path: path, inputs=camera_pose_path, outputs=camera_pose_filepath_display, api_name="get_camera_pose_path_transcam")
+
     demo.launch(share=False, server_name=server_name, server_port=server_port)
+
